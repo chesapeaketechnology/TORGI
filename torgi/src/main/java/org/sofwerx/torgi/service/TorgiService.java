@@ -24,13 +24,25 @@ import android.preference.PreferenceManager;
 import androidx.annotation.Nullable;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
+import gov.agilemeridian.gnss.GnssReportProto;
+
 import android.util.Log;
 
+import com.google.common.io.BaseEncoding;
+import com.google.protobuf.FloatValue;
+import com.google.protobuf.Int32Value;
+import com.google.protobuf.Timestamp;
+
+import net.sf.marineapi.nmea.sentence.Checksum;
+
+import org.jyre.ZreInterface;
 import org.sofwerx.torgi.Config;
+import org.sofwerx.torgi.gnss.Constellation;
 import org.sofwerx.torgi.gnss.DataPoint;
 import org.sofwerx.torgi.gnss.EWIndicators;
 import org.sofwerx.torgi.gnss.GNSSEWValues;
 import org.sofwerx.torgi.gnss.LatLng;
+import org.sofwerx.torgi.gnss.SatMeasurement;
 import org.sofwerx.torgi.gnss.Satellite;
 import org.sofwerx.torgi.gnss.SpaceTime;
 import org.sofwerx.torgi.gnss.helper.GeoPackageGPSPtHelper;
@@ -40,15 +52,10 @@ import org.sofwerx.torgi.listener.GnssMeasurementListener;
 import org.sofwerx.torgi.R;
 import org.sofwerx.torgi.listener.SensorListener;
 import org.sofwerx.ogc.sos.AbstractSosOperation;
-import org.sofwerx.ogc.sos.OperationInsertResult;
-import org.sofwerx.ogc.sos.OperationInsertResultTemplate;
-import org.sofwerx.ogc.sos.OperationInsertSensor;
-import org.sofwerx.ogc.sos.SensorLocationResultTemplateField;
 import org.sofwerx.ogc.sos.SensorMeasurement;
 import org.sofwerx.ogc.sos.SensorMeasurementLocation;
 import org.sofwerx.ogc.sos.SensorMeasurementTime;
 import org.sofwerx.ogc.sos.SensorResultTemplateField;
-import org.sofwerx.ogc.sos.SensorTimeResultTemplateField;
 import org.sofwerx.ogc.sos.SosIpcTransceiver;
 import org.sofwerx.ogc.sos.SosMessageListener;
 import org.sofwerx.ogc.sos.SosSensor;
@@ -56,14 +63,16 @@ import org.sofwerx.ogc.sos.SosService;
 import org.sofwerx.torgi.ui.FailureActivity;
 import org.sofwerx.torgi.ui.Heatmap;
 import org.sofwerx.torgi.util.CallsignUtil;
-import org.w3c.dom.Document;
-import org.w3c.dom.Element;
-import org.w3c.dom.NodeList;
+import org.sofwerx.torgi.util.RateLimiter;
+import org.zeromq.api.Message;
 
 import java.io.File;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.ArrayList;
-
-import javax.xml.parsers.ParserConfigurationException;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 
 import static org.sofwerx.torgi.service.TorgiService.InputSourceType.LOCAL;
 import static org.sofwerx.torgi.service.TorgiService.InputSourceType.LOCAL_FILE;
@@ -74,6 +83,11 @@ import static org.sofwerx.torgi.service.TorgiService.InputSourceType.LOCAL_FILE;
  * this info available to any listening UI element.
  */
 public class TorgiService extends Service implements SosMessageListener {
+
+    public static final String GNSS_REPORTS = "gnss-reports";
+    private static final String TRANSMIT_DATA = "$TD HT=%d,PR=%d,%s";
+    private String callsignCondensed;
+
     public enum InputSourceType {LOCAL,LOCAL_FILE};
     private final static String TAG = "TORGISvc";
     private final static int TORGI_NOTIFICATION_ID = 1;
@@ -100,6 +114,11 @@ public class TorgiService extends Service implements SosMessageListener {
     private final static long TIME_TO_WAIT_FOR_GNSS_RAW_BEFORE_FAILURE = 1000l * 15l; //time to wait between first location measurement received and considering this device does not likely support raw GNSS collection
     private boolean gnssRawSupportKnown = false;
 
+
+    private ZreInterface zmqInterface;
+    private UDPSwarmSender udpSwarmSender;
+    private RateLimiter rateLimiter = new RateLimiter(1, 16*60000);
+
     public void setListener(GnssMeasurementListener listener) {
         this.listener = listener;
     }
@@ -115,6 +134,7 @@ public class TorgiService extends Service implements SosMessageListener {
 
     public void start() {
         start(inputSourceType);
+
     }
 
     public void start(InputSourceType inputSourceType) {
@@ -168,6 +188,7 @@ public class TorgiService extends Service implements SosMessageListener {
             setForeground();
             Heatmap.clear();
             setupSosService();
+            startZyreService();
         }
     }
 
@@ -187,8 +208,8 @@ public class TorgiService extends Service implements SosMessageListener {
             edit.apply();
         }
         callsign = callsign + " TORGI";
-        String callsignCondensed = callsign.replace(' ','-').toLowerCase();
-        sosSensor = new SosSensor(callsign,callsignCondensed,"TORGI","Tactical Observation of RF and GNSS Interference sensor");
+        callsignCondensed = callsign.replace(' ','-').toLowerCase();
+        sosSensor = new SosSensor(callsign, callsignCondensed,"TORGI","Tactical Observation of RF and GNSS Interference sensor");
         sosSensor.setAssignedProcedure(prefs.getString(Config.PREFS_SOS_ASSIGNED_PROCEDURE,null));
         sosSensor.setAssignedOffering(prefs.getString(Config.PREFS_SOS_ASSIGNED_OFFERING,null));
         sosSensor.setAssignedTemplate(prefs.getString(Config.PREFS_SOS_ASSIGNED_TEMPLATE,null));
@@ -268,11 +289,36 @@ public class TorgiService extends Service implements SosMessageListener {
         }
     }
 
+
+
     public void stopSensorService() {
         if (sensorService != null) {
             sensorService.shutdown();
             sensorService = null;
             Log.d(TAG, "sensor service shutdown");
+        }
+    }
+
+    public void startZyreService() {
+        if (udpSwarmSender == null) {
+            try {
+                udpSwarmSender = new UDPSwarmSender(InetAddress.getByName("192.168.17.1"),5280);
+                udpSwarmSender.run();
+            } catch (UnknownHostException e) {
+                e.printStackTrace();
+            }
+//            zmqInterface.start();
+//            zmqInterface.join(GNSS_REPORTS);
+            Log.d(TAG, "swarm sender service started");
+        }
+    }
+
+    public void stopZyreService() {
+        if (udpSwarmSender != null) {
+//            zmqInterface.leave(GNSS_REPORTS);
+//            zmqInterface.stop();
+//            zmqInterface = null;
+            Log.d(TAG, "zmq service shutdown");
         }
     }
 
@@ -339,7 +385,14 @@ public class TorgiService extends Service implements SosMessageListener {
     }
 
     public void updateLocation(final Location loc) {
-        currentLocation = loc;
+
+
+
+
+
+
+
+            currentLocation = loc;
         if (history == null)
             history = new ArrayList<>();
         history.add(new LatLng(loc.getLatitude(), loc.getLongitude()));
@@ -388,6 +441,7 @@ public class TorgiService extends Service implements SosMessageListener {
      */
     public void shutdown() {
         stopSelf();
+
     }
 
     @Nullable
@@ -458,6 +512,7 @@ public class TorgiService extends Service implements SosMessageListener {
 
     private void unregisterLocalSensors() {
         stopSensorService();
+        stopZyreService();
     }
 
     @Override
@@ -607,6 +662,7 @@ public class TorgiService extends Service implements SosMessageListener {
                 Heatmap.put(dp, indicators);
                 if (listener != null)
                     listener.onEWDataProcessed(dp, indicators);
+                sendToZMQ(dp);
                 if (geoPackageRecorder != null)
                     geoPackageRecorder.onEWDataProcessed(dp,indicators);
                 if ((sosSensor != null) && sosSensor.isReadyToSendResults() && (System.currentTimeMillis() > nextSosReportTime)) {
@@ -626,11 +682,50 @@ public class TorgiService extends Service implements SosMessageListener {
                                 sosMeasurementAgc.setValue(values.getAgc());
                             }
                             sosService.broadcastSensorReadings();
+
                         }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Builds and sends a Protobuf3 message containing a subset of GNSS reports and averages to ZMQ.
+     * @param dp Datapoint to forward to other discovered Zyre participants.
+     */
+    public void sendToZMQ(final DataPoint dp) {
+        GnssReportProto.GnssReport.Builder report = GnssReportProto.GnssReport.newBuilder();
+
+        report.setLatLng(GnssReportProto.LatLng.newBuilder().setLatitude((float) dp.getSpaceTime().getLatitude()).setLongitude((float) dp.getSpaceTime().getLongitude()).build());
+
+        report.setCallsign(callsignCondensed);
+        report.setAltitude(FloatValue.newBuilder().setValue((float) dp.getSpaceTime().getAltitude()).build());
+        long millis = dp.getSpaceTime().getTime();
+        Timestamp timestamp = Timestamp.newBuilder().setSeconds(millis / 1000)
+                .setNanos((int) ((millis % 1000) * 1000000)).build();
+        report.setSysTime(timestamp);
+
+        //Currently only grabbing the average value and sending.
+        GNSSEWValues ewValues = dp.getAverageMeasurements();
+        GnssReportProto.GNSSMeasurement.Builder measure = GnssReportProto.GNSSMeasurement.newBuilder();
+
+        measure.setAgcdB(FloatValue.newBuilder().setValue((float) ewValues.getAgc()).build());
+
+        measure.setConstellation(GnssReportProto.Constellation.GPS);
+        measure.setCn0DbHz(FloatValue.newBuilder().setValue(ewValues.getCn0()).build());
+
+        report.addMeasurements(measure);
+
+        GnssReportProto.PacketWrapper wrapperToEncode = GnssReportProto.PacketWrapper.newBuilder().setGnssReport(report).build();
+
+        String toSend = Checksum.add(String.format(TRANSMIT_DATA, TimeUnit.SECONDS.toSeconds(3600), 50, BaseEncoding.base16().encode(wrapperToEncode.toByteArray())));
+
+        if(rateLimiter.canAdd()) {
+            udpSwarmSender.send(toSend.getBytes());
+        }
+//        zmqInterface.shout(GNSS_REPORTS, new Message(wrapperToEncode.toByteArray()));
+
     }
 
     public Location getCurrentLocation() {

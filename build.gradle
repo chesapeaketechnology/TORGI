@@ -16,11 +16,16 @@ buildscript {
     }
 }
 
+
 allprojects {
     repositories {
         google()
         jcenter()
         maven { url 'https://jitpack.io' } //for charts
+        mavenLocal()
+        maven {
+            url "https://dl.bintray.com/chesapeaketechnology/maven-public"
+        }
     }
 }
 
